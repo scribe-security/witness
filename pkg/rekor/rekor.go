@@ -19,8 +19,10 @@ import (
 	"context"
 	"crypto"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-openapi/runtime"
@@ -31,8 +33,11 @@ import (
 	"github.com/sigstore/rekor/pkg/generated/models"
 	"github.com/sigstore/rekor/pkg/types"
 	rekordsse "github.com/sigstore/rekor/pkg/types/dsse/v0.0.1"
+	witness "github.com/testifysec/witness/pkg"
 	"github.com/testifysec/witness/pkg/cryptoutil"
 	"github.com/testifysec/witness/pkg/dsse"
+	"github.com/testifysec/witness/pkg/intoto"
+	"github.com/testifysec/witness/pkg/log"
 )
 
 var (
@@ -41,11 +46,13 @@ var (
 
 type wrappedRekorClient struct {
 	*generatedClient.Rekor
+	url string
 }
 
 type RekorClient interface {
 	StoreArtifact(artifactBytes, pubkeyBytes []byte) (*entries.CreateLogEntryCreated, error)
 	FindEntriesBySubject(cryptoutil.DigestSet) ([]*models.LogEntryAnon, error)
+	FindEvidence([]cryptoutil.DigestSet, dsse.Envelope, []cryptoutil.Verifier, []witness.CollectionEnvelope, int32) ([]witness.CollectionEnvelope, error)
 }
 
 func New(rekorServer string) (RekorClient, error) {
@@ -56,6 +63,7 @@ func New(rekorServer string) (RekorClient, error) {
 
 	return &wrappedRekorClient{
 		Rekor: client,
+		url:   rekorServer,
 	}, nil
 }
 
@@ -85,6 +93,101 @@ func (r *wrappedRekorClient) getTlogEntry(uuid string) (*models.LogEntryAnon, er
 		return &e, nil
 	}
 	return nil, errors.New("empty response")
+}
+
+func (r *wrappedRekorClient) FindEvidence(subject []cryptoutil.DigestSet, policyEnvelope dsse.Envelope, verifier []cryptoutil.Verifier, verifiedEnvelopes []witness.CollectionEnvelope, recursionLimit int32) ([]witness.CollectionEnvelope, error) {
+	entries := []*models.LogEntryAnon{}
+
+	for _, ds := range subject {
+		for _, name := range ds {
+			log.Infof("Searching for entry with subject %v", name)
+		}
+
+		entry, err := r.FindEntriesBySubject(ds)
+		if err != nil {
+			return nil, err
+		}
+
+		entries = append(entries, entry...)
+	}
+
+	var evidenceToVerify []witness.CollectionEnvelope
+
+	for _, entry := range entries {
+
+		envelope, err := ParseEnvelopeFromEntry(entry)
+		if err != nil {
+			return nil, err
+		}
+
+		reference := fmt.Sprintf("%s/api/v1/log/entries?logIndex=%d", r.url, *entry.LogIndex)
+
+		collectionEnvelope := witness.CollectionEnvelope{
+			Envelope:  envelope,
+			Reference: reference,
+		}
+
+		evidenceToVerify = append(evidenceToVerify, collectionEnvelope)
+	}
+
+	concat := append(verifiedEnvelopes, evidenceToVerify...)
+
+	veropt := witness.VerifyWithCollectionEnvelopesE(concat)
+
+	verifiedEvidence, err := witness.VerifyE(policyEnvelope, verifier, veropt)
+
+	if err == nil {
+		return verifiedEvidence, nil
+	} else if recursionLimit > 0 {
+
+		backrefSubjs, err := getBackRefSubjects(evidenceToVerify)
+		if err != nil {
+			return nil, err
+		}
+
+		return r.FindEvidence(backrefSubjs, policyEnvelope, verifier, verifiedEvidence, recursionLimit-1)
+	}
+
+	return nil, err
+}
+
+func getBackRefSubjects(verifiedEvidence []witness.CollectionEnvelope) ([]cryptoutil.DigestSet, error) {
+	var backRefSubjects []cryptoutil.DigestSet
+
+	subjects := []intoto.Subject{}
+
+	for _, ce := range verifiedEvidence {
+		statementBytes := ce.Envelope.Payload
+		statement := intoto.Statement{}
+		if err := json.Unmarshal(statementBytes, &statement); err != nil {
+			return nil, err
+		}
+
+		subjects = append(subjects, statement.Subject...)
+
+	}
+
+	for _, subject := range subjects {
+		//TODO: Remove hack
+		fmt.Println(subject.Name)
+		if strings.Contains(subject.Name, "https://witness.dev/attestations/gitlab/v0.1/pipelineurl") {
+			fmt.Println("Found gitlab subject")
+			fmt.Println(subject.Name)
+
+			ds := cryptoutil.DigestSet{}
+			for name, value := range subject.Digest {
+				switch name {
+				case "sha256":
+					ds[crypto.SHA256] = value
+				case "sha1":
+					ds[crypto.SHA1] = value
+				}
+			}
+
+			backRefSubjects = append(backRefSubjects, ds)
+		}
+	}
+	return backRefSubjects, nil
 }
 
 func (r *wrappedRekorClient) FindEntriesBySubject(subjectDigestSet cryptoutil.DigestSet) ([]*models.LogEntryAnon, error) {

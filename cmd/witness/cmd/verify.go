@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/spf13/cobra"
 	"github.com/testifysec/witness/cmd/witness/options"
 	witness "github.com/testifysec/witness/pkg"
@@ -74,36 +75,54 @@ func runVerify(vo options.VerifyOptions, args []string) error {
 		return fmt.Errorf("could not unmarshal policy envelope: %w", err)
 	}
 
-	envelopes := make([]witness.CollectionEnvelope, 0)
-	diskEnvs, err := loadEnvelopesFromDisk(vo.AttestationFilePaths)
-	if err != nil {
-		return fmt.Errorf("failed to load attestation files: %w", err)
-	}
+	// envelopes := make([]witness.CollectionEnvelope, 0)
+	// diskEnvs, err := loadEnvelopesFromDisk(vo.AttestationFilePaths)
+	// if err != nil {
+	// 	return fmt.Errorf("failed to load attestation files: %w", err)
+	// }
 
-	envelopes = append(envelopes, diskEnvs...)
+	// envelopes = append(envelopes, diskEnvs...)
+
+	verifiedEvidence := []witness.CollectionEnvelope{}
+
 	if vo.RekorServer != "" {
+
 		artifactDigestSet, err := cryptoutil.CalculateDigestSetFromFile(vo.ArtifactFilePath, []crypto.Hash{crypto.SHA256})
 		if err != nil {
 			return fmt.Errorf("failed to calculate artifact file's hash: %w", err)
 		}
 
-		rekorEnvs, err := loadEnvelopesFromRekor(vo.RekorServer, artifactDigestSet)
+		rc, err := rekor.New(vo.RekorServer)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get initialize Rekor client: %w", err)
 		}
 
-		envelopes = append(envelopes, rekorEnvs...)
+		digestSets := []cryptoutil.DigestSet{}
+		digestSets = append(digestSets, artifactDigestSet)
+
+		verifiers := []cryptoutil.Verifier{}
+		verifiers = append(verifiers, verifier)
+
+		evidence, err := rc.FindEvidence(digestSets, policyEnvelope, verifiers, []witness.CollectionEnvelope{}, 2)
+		if err != nil {
+			spew.Dump(evidence)
+			return fmt.Errorf("failed to find evidence: %w", err)
+		}
+
+		spew.Dump(evidence)
+
+		verifiedEvidence = append(verifiedEvidence, evidence...)
 	}
 
-	evidence, err := witness.VerifyE(policyEnvelope, []cryptoutil.Verifier{verifier}, witness.VerifyWithCollectionEnvelopesE(envelopes))
-	if err != nil {
-		return fmt.Errorf("failed to verify policy: %w", err)
+	// evidence, err := witness.VerifyE(policyEnvelope, []cryptoutil.Verifier{verifier}, witness.VerifyWithCollectionEnvelopesE(envelopes))
+	// if err != nil {
+	// 	return fmt.Errorf("failed to verify policy: %w", err)
 
-	}
+	// }
 
 	evidenceString := []string{}
 
-	for _, e := range evidence {
+	for _, e := range verifiedEvidence {
 		evidenceString = append(evidenceString, e.Reference)
 	}
 
@@ -178,4 +197,5 @@ func loadEnvelopesFromRekor(rekorServer string, artifactDigestSet cryptoutil.Dig
 	}
 
 	return envelopes, nil
+
 }
