@@ -22,7 +22,6 @@ import (
 	"io"
 	"os"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/spf13/cobra"
 	"github.com/testifysec/witness/cmd/witness/options"
 	witness "github.com/testifysec/witness/pkg"
@@ -48,6 +47,10 @@ func VerifyCmd() *cobra.Command {
 	vo.AddFlags(cmd)
 	return cmd
 }
+
+const (
+	MAX_DEPTH = 4
+)
 
 //todo: this logic should be broken out and moved to pkg/
 //we need to abstract where keys are coming from, etc
@@ -75,13 +78,10 @@ func runVerify(vo options.VerifyOptions, args []string) error {
 		return fmt.Errorf("could not unmarshal policy envelope: %w", err)
 	}
 
-	// envelopes := make([]witness.CollectionEnvelope, 0)
-	// diskEnvs, err := loadEnvelopesFromDisk(vo.AttestationFilePaths)
-	// if err != nil {
-	// 	return fmt.Errorf("failed to load attestation files: %w", err)
-	// }
-
-	// envelopes = append(envelopes, diskEnvs...)
+	diskEnvs, err := loadEnvelopesFromDisk(vo.AttestationFilePaths)
+	if err != nil {
+		return fmt.Errorf("failed to load attestation files: %w", err)
+	}
 
 	verifiedEvidence := []witness.CollectionEnvelope{}
 
@@ -103,35 +103,27 @@ func runVerify(vo options.VerifyOptions, args []string) error {
 		verifiers := []cryptoutil.Verifier{}
 		verifiers = append(verifiers, verifier)
 
-		evidence, err := rc.FindEvidence(digestSets, policyEnvelope, verifiers, []witness.CollectionEnvelope{}, 2)
+		evidence, err := rc.FindEvidence(digestSets, policyEnvelope, verifiers, diskEnvs, MAX_DEPTH)
 		if err != nil {
-			spew.Dump(evidence)
 			return fmt.Errorf("failed to find evidence: %w", err)
 		}
-
-		spew.Dump(evidence)
 
 		verifiedEvidence = append(verifiedEvidence, evidence...)
 	}
 
-	// evidence, err := witness.VerifyE(policyEnvelope, []cryptoutil.Verifier{verifier}, witness.VerifyWithCollectionEnvelopesE(envelopes))
-	// if err != nil {
-	// 	return fmt.Errorf("failed to verify policy: %w", err)
+	if vo.RekorServer == "" {
+		verifiedEvidence, err = witness.VerifyE(policyEnvelope, []cryptoutil.Verifier{verifier}, witness.VerifyWithCollectionEnvelopesE(diskEnvs))
+		if err != nil {
+			return fmt.Errorf("failed to verify policy: %w", err)
 
-	// }
-
-	evidenceString := []string{}
-
-	for _, e := range verifiedEvidence {
-		evidenceString = append(evidenceString, e.Reference)
+		}
 	}
 
 	log.Info("Verification succeeded")
 	log.Info("Evidence:")
-	for i, e := range evidenceString {
-		log.Info(fmt.Sprintf("%d: %s", i+1, e))
+	for i, e := range verifiedEvidence {
+		log.Info(fmt.Sprintf("%d: %s", i, e.Reference))
 	}
-
 	return nil
 
 }

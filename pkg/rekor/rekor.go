@@ -40,13 +40,22 @@ import (
 	"github.com/testifysec/witness/pkg/log"
 )
 
+const refString = "%s/api/v1/log/entries?logIndex=%d"
+
 var (
 	rekorSupportedHashes = map[crypto.Hash]string{crypto.SHA256: "sha256", crypto.SHA1: "sha1"}
+	backRefs             = []string{
+		"https://witness.dev/attestations/gitlab/v0.1/pipelineurl",
+		"https://witness.dev/attestations/git/v0.1/commithash",
+		"https://witness.dev/attestations/product/v0.1/file",
+	}
 )
 
 type wrappedRekorClient struct {
 	*generatedClient.Rekor
-	url string
+	url            string
+	searchedHashes map[string]bool
+	searchedIndex  map[string]bool
 }
 
 type RekorClient interface {
@@ -62,8 +71,10 @@ func New(rekorServer string) (RekorClient, error) {
 	}
 
 	return &wrappedRekorClient{
-		Rekor: client,
-		url:   rekorServer,
+		Rekor:          client,
+		url:            rekorServer,
+		searchedHashes: map[string]bool{},
+		searchedIndex:  map[string]bool{},
 	}, nil
 }
 
@@ -96,19 +107,19 @@ func (r *wrappedRekorClient) getTlogEntry(uuid string) (*models.LogEntryAnon, er
 }
 
 func (r *wrappedRekorClient) FindEvidence(subject []cryptoutil.DigestSet, policyEnvelope dsse.Envelope, verifier []cryptoutil.Verifier, verifiedEnvelopes []witness.CollectionEnvelope, recursionLimit int32) ([]witness.CollectionEnvelope, error) {
+
 	entries := []*models.LogEntryAnon{}
-
 	for _, ds := range subject {
-		for _, name := range ds {
-			log.Infof("Searching for entry with subject %v", name)
-		}
-
 		entry, err := r.FindEntriesBySubject(ds)
 		if err != nil {
 			return nil, err
 		}
 
-		entries = append(entries, entry...)
+		for _, e := range entry {
+			if !r.searchedIndex[fmt.Sprintf(refString, r.url, e.LogIndex)] {
+				entries = append(entries, e)
+			}
+		}
 	}
 
 	var evidenceToVerify []witness.CollectionEnvelope
@@ -120,7 +131,7 @@ func (r *wrappedRekorClient) FindEvidence(subject []cryptoutil.DigestSet, policy
 			return nil, err
 		}
 
-		reference := fmt.Sprintf("%s/api/v1/log/entries?logIndex=%d", r.url, *entry.LogIndex)
+		reference := fmt.Sprintf(refString, r.url, *entry.LogIndex)
 
 		collectionEnvelope := witness.CollectionEnvelope{
 			Envelope:  envelope,
@@ -130,21 +141,29 @@ func (r *wrappedRekorClient) FindEvidence(subject []cryptoutil.DigestSet, policy
 		evidenceToVerify = append(evidenceToVerify, collectionEnvelope)
 	}
 
-	concat := append(verifiedEnvelopes, evidenceToVerify...)
-
-	veropt := witness.VerifyWithCollectionEnvelopesE(concat)
-
+	veropt := witness.VerifyWithCollectionEnvelopesE(append(verifiedEnvelopes, evidenceToVerify...))
 	verifiedEvidence, err := witness.VerifyE(policyEnvelope, verifier, veropt)
 
+	//remove dups
+
 	if err == nil {
+		deduped := map[string]witness.CollectionEnvelope{}
+
+		for _, e := range verifiedEvidence {
+			deduped[e.Reference] = e
+		}
+
+		verifiedEvidence = []witness.CollectionEnvelope{}
+		for _, e := range deduped {
+			verifiedEvidence = append(verifiedEvidence, e)
+		}
+
 		return verifiedEvidence, nil
 	} else if recursionLimit > 0 {
-
 		backrefSubjs, err := getBackRefSubjects(evidenceToVerify)
 		if err != nil {
 			return nil, err
 		}
-
 		return r.FindEvidence(backrefSubjs, policyEnvelope, verifier, verifiedEvidence, recursionLimit-1)
 	}
 
@@ -168,23 +187,22 @@ func getBackRefSubjects(verifiedEvidence []witness.CollectionEnvelope) ([]crypto
 	}
 
 	for _, subject := range subjects {
-		//TODO: Remove hack
-		fmt.Println(subject.Name)
-		if strings.Contains(subject.Name, "https://witness.dev/attestations/gitlab/v0.1/pipelineurl") {
-			fmt.Println("Found gitlab subject")
-			fmt.Println(subject.Name)
+		for _, backRef := range backRefs {
+			if strings.Contains(subject.Name, backRef) {
+				log.Infof("Found backref %s", subject.Name)
 
-			ds := cryptoutil.DigestSet{}
-			for name, value := range subject.Digest {
-				switch name {
-				case "sha256":
-					ds[crypto.SHA256] = value
-				case "sha1":
-					ds[crypto.SHA1] = value
+				ds := cryptoutil.DigestSet{}
+				for name, value := range subject.Digest {
+					switch name {
+					case "sha256":
+						ds[crypto.SHA256] = value
+					case "sha1":
+						ds[crypto.SHA1] = value
+					}
 				}
-			}
 
-			backRefSubjects = append(backRefSubjects, ds)
+				backRefSubjects = append(backRefSubjects, ds)
+			}
 		}
 	}
 	return backRefSubjects, nil
@@ -200,6 +218,12 @@ func (r *wrappedRekorClient) FindEntriesBySubject(subjectDigestSet cryptoutil.Di
 			break
 		}
 	}
+
+	if r.searchedHashes[params.Query.Hash] {
+		return nil, nil
+	}
+
+	log.Infof("Searching for entries with subject hash: %s", params.Query.Hash)
 
 	searchIndex, err := r.Index.SearchIndex(params)
 	if err != nil {
@@ -217,6 +241,10 @@ func (r *wrappedRekorClient) FindEntriesBySubject(subjectDigestSet cryptoutil.Di
 		entries = append(entries, entry)
 	}
 
+	r.searchedHashes[params.Query.Hash] = true
+	for _, entry := range entries {
+		r.searchedIndex[fmt.Sprintf(refString, r.url, *entry.LogIndex)] = true
+	}
 	return entries, nil
 }
 
