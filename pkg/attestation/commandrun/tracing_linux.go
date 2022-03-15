@@ -139,6 +139,10 @@ func (p *ptraceContext) nextSyscall(pid int) error {
 	return nil
 }
 
+func testFlag(flags uintptr, flag int) bool {
+	return (flags & uintptr(flag)) == uintptr(flag)
+}
+
 func (p *ptraceContext) handleSyscall(pid int, regs unix.PtraceRegs) error {
 	argArray := getSyscallArgs(regs)
 	syscallId := getSyscallId(regs)
@@ -197,6 +201,7 @@ func (p *ptraceContext) handleSyscall(pid int, regs unix.PtraceRegs) error {
 		}
 
 	case unix.SYS_OPENAT:
+
 		file, err := p.readSyscallReg(pid, argArray[1], MAX_PATH_LEN)
 		if err != nil {
 			return err
@@ -208,7 +213,13 @@ func (p *ptraceContext) handleSyscall(pid int, regs unix.PtraceRegs) error {
 			return err
 		}
 
-		procInfo.OpenedFiles[file] = digestSet
+		flags := argArray[2]
+		if testFlag(flags, os.O_RDONLY) || testFlag(flags,os.O_RDWR) {
+			procInfo.OpenedFiles[file] = digestSet
+		}
+		if testFlag(flags, os.O_WRONLY) || testFlag(flags,os.O_RDWR) {
+			procInfo.WrittenFiles[file] = digestSet
+		}
 	}
 
 	return nil
@@ -220,6 +231,7 @@ func (ctx *ptraceContext) getProcInfo(pid int) *ProcessInfo {
 		procInfo = &ProcessInfo{
 			ProcessID:   pid,
 			OpenedFiles: make(map[string]cryptoutil.DigestSet),
+			WrittenFiles: make(map[string]cryptoutil.DigestSet),
 		}
 
 		ctx.processes[pid] = procInfo

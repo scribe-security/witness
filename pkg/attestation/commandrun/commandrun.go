@@ -80,6 +80,7 @@ type ProcessInfo struct {
 	Cmdline          string                          `json:"cmdline,omitempty"`
 	ExeDigest        cryptoutil.DigestSet            `json:"exedigest,omitempty"`
 	OpenedFiles      map[string]cryptoutil.DigestSet `json:"openedfiles,omitempty"`
+	WrittenFiles     map[string]cryptoutil.DigestSet `json:"writtenfiles,omitempty"`
 	Environ          string                          `json:"environ,omitempty"`
 	SpecBypassIsVuln bool                            `json:"specbypassisvuln,omitempty"`
 }
